@@ -1,0 +1,473 @@
+---
+title: "Analysis of COVID-19’s Impact on Kickstarter Campaigns"
+author: "Conor O'Regan, Brendan O'Connor, Vineeth Appala"
+date: "12/7/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("install.load")
+install_load <- function(pack){
+  new_pack_load <- pack[!(pack %in% installed.packages()[,"Package"])]
+  if (length(new_pack_load))
+    install.packages(new_pack_load, dependencies = TRUE)
+  sapply(pack, require, character.only = TRUE)
+}
+
+package_load <- c("ggplot2", "dplyr", "tidyverse", "NLP", "tm", "stringr", "jsonlite", "DT", "lubridate", "tidytext", "wordcloud", "igraph", "ggraph", "widyr", "ggmap", "leaflet", "scales", "textcat", "textdata", "magrittr", "lexicon")
+
+install_load(package_load)
+
+march2020_data <- list.files(path = "/Users/conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/Kickstarter_2020-03-12T03_20_06_551Z",     # Identify all csv files in folder
+        pattern = "*.csv", full.names = TRUE) %>% 
+        lapply(read_csv) %>%                                            # Store all files in list
+        bind_rows                                                       # Combine data sets into one data set 
+
+march2019_data <- list.files(path = "/Users/conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/Kickstarter_2019-03-14T03_20_12_200Z",     # Identify all csv files in folder
+        pattern = "*.csv", full.names = TRUE) %>% 
+        lapply(read_csv) %>%                                            # Store all files in list
+        bind_rows                                                       # Combine data sets into one data set 
+
+nov2019_data <- list.files(path = "/Users/conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/Kickstarter_2019-11-14T03_20_27_004Z",     # Identify all csv files in folder
+        pattern = "*.csv", full.names = TRUE) %>% 
+        lapply(read_csv) %>%                                            # Store all files in list
+        bind_rows                                                       # Combine data sets into one data set 
+
+nov2020_data <- list.files(path = "/Users/conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/Kickstarter_2020-11-12T03_20_11_453Z",     # Identify all csv files in folder
+        pattern = "*.csv", full.names = TRUE) %>% 
+        lapply(read_csv) %>%                                            # Store all files in list
+        bind_rows    
+
+write.csv(march2020_data,'march2020.csv')
+write.csv(march2019_data,'march2019.csv')
+write.csv(nov2020_data,'nov2020.csv')
+write.csv(nov2019_data,'nov2019.csv')
+
+march2019_data <- read_csv("/Users/Conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/march2019.csv")
+march2020_data <- read_csv("/Users/Conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/march2020.csv")
+nov2019_data <- read_csv("/Users/Conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/nov2019.csv")
+nov2020_data <- read_csv("/Users/Conor/Desktop/Grad School/Term 2/Communication of Data/Final Project/nov2020.csv")
+```
+
+**DS 804: Communication of Data**
+
+Kickstarter is a community of creators and backers. Our goal for this project was to analyze whether COVID-19 is having an impact on people supporting various campaigns on Kickstarter. After performing some exploratory analysis on the data, we developed and answered specific research questions relevant to the main goal.
+
+The data itself is obtained from [webrobots.io](https://webrobots.io/kickstarter-datasets/), who use a scraper robot to crawl all Kickstarter projects and collects data in CSV format. We implemented data from March and November of 2019 and 2020 to get a reasonable idea of the landscape of Kickstarter campaigns pre-COVID and post-COVID. 
+
+The methodology utilized for importing these datasets is as follows: each folder with the month’s individual .csv files was loaded using the “list.files” function. Using the pattern of “.csv”, the “lapply” function of “read_csv” read in each individual file which was then binded into one large dataset using the “bind_rows” function. Doing this for each month’s folders of CSV files left us with four datasets in .csv format to use for our analysis.
+
+```{r}
+glimpse(march2019_data)
+```
+
+# Exploratory Analysis
+
+### Percentage of Campaigns Which Reached Their Goal
+
+```{r}
+march2019_data %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n)*100)
+
+nov2019_data %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n)*100)
+
+march2020_data %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n)*100)
+
+nov2020_data %>%
+  select(state) %>%
+  count(state)%>%
+  mutate(percentage = n/sum(n)*100)
+```
+
+### Filtering Only Failed and Successful Campaigns
+
+We were most concerned with projects which either were fully successful or fully failed. Therefore, we filtered out all projects which fell under the states, “canceled”, “live”, and “suspended”. This resulted in more relevant analyses and faster processing times.
+
+```{r}
+nov2020_bool <- nov2020_data %>%
+  filter(state == 'successful' | state == 'failed')
+
+nov2019_bool <- nov2019_data %>%
+  filter(state == 'successful' | state == 'failed')
+
+march2020_bool <- march2020_data %>%
+  filter(state == 'successful' | state == 'failed')
+
+march2019_bool <- march2019_data %>%
+  filter(state == 'successful' | state == 'failed')
+```
+
+### Cleaning Location and Category Variables
+
+To clean the location and category variables, we used the “gsub” function to replace any non-letter characters with nothing (essentially deleting any non-letter characters). After this, we used the “str_match” function to match a wildcard string that is between two other identifier strings. Using this syntax, we were able to select only the exact category, city, and state abbreviation names and redefine those categories to include the cleaned data. We also created a new variable called  ”time-period” that would categorize each dataset into one of four time periods, those being ”March 2019”, ”November 2019”, ”March 2020”, and ”November 2020” by repeating that string of text by however many rows there were in each dataset. This would assist us in categorizing by time period for later analyses. This methodology was applied to each month’s dataset, we are only including one for the sake of redundancy. 
+
+```{r}
+march2019_bool_cleaned <- march2019_bool %>%
+  mutate(march2019_category_clean = gsub("[^a-zA-Z]", "", category)) %>%
+  mutate(march2019_category_new = str_match(march2019_category_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(march2019_category = march2019_category_new[,2]) %>%
+  mutate(category = march2019_category) %>%
+  mutate(march2019_location_clean = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(march2019_location_new = str_match(march2019_location_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(march2019_location = march2019_location_new[,2]) %>%
+  mutate(city = march2019_location) %>%
+  mutate(march2019_location_abbr = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(march2019_abbr_new = str_match(march2019_location_abbr, "state\\s*(.*?)\\s*type")) %>%
+  mutate(abbr = march2019_abbr_new[,2]) %>%
+  mutate(time_period = rep("March 2019", 192664)) %>%
+  select(X1:usd_type, city, abbr, time_period)
+
+march2019_bool %>%
+  mutate(march2019_category_clean = gsub("[^a-zA-Z]", "", category)) %>%
+  mutate(march2019_location_clean = gsub("[^a-zA-Z]", "", location)) %>%
+  select(march2019_location_clean, march2019_category_clean)
+
+nov2019_bool_cleaned <- nov2019_bool %>%
+  mutate(nov2019_category_clean = gsub("[^a-zA-Z]", "", category)) %>%
+  mutate(nov2019_category_new = str_match(nov2019_category_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(nov2019_category = nov2019_category_new[,2]) %>%
+  mutate(category = nov2019_category) %>%
+  mutate(nov2019_location_clean = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(nov2019_location_new = str_match(nov2019_location_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(nov2019_location = nov2019_location_new[,2]) %>%
+  mutate(city = nov2019_location) %>%
+  mutate(nov2019_location_abbr = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(nov2019_abbr_new = str_match(nov2019_location_abbr, "state\\s*(.*?)\\s*type")) %>%
+  mutate(abbr = nov2019_abbr_new[,2]) %>%
+  mutate(time_period = rep("November 2019", 194752)) %>%
+  select(X1:usd_type, city, abbr, time_period)
+
+march2020_bool_cleaned <- march2020_bool %>%
+  mutate(march2020_category_clean = gsub("[^a-zA-Z]", "", category)) %>%
+  mutate(march2020_category_new = str_match(march2020_category_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(march2020_category = march2020_category_new[,2]) %>%
+  mutate(category = march2020_category) %>%
+  mutate(march2020_location_clean = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(march2020_location_new = str_match(march2020_location_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(march2020_location = march2020_location_new[,2]) %>%
+  mutate(city = march2020_location) %>%
+  mutate(march2020_location_abbr = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(march2020_abbr_new = str_match(march2020_location_abbr, "state\\s*(.*?)\\s*type")) %>%
+  mutate(abbr = march2020_abbr_new[,2]) %>%
+  mutate(time_period = rep("March 2020", 199821)) %>%
+  select(X1:usd_type, city, abbr, time_period)
+
+nov2020_bool_cleaned <- nov2020_bool %>%
+  mutate(nov2020_category_clean = gsub("[^a-zA-Z]", "", category)) %>%
+  mutate(nov2020_category_new = str_match(nov2020_category_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(nov2020_category = nov2020_category_new[,2]) %>%
+  mutate(category = nov2020_category) %>%
+  mutate(nov2020_location_clean = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(nov2020_location_new = str_match(nov2020_location_clean, "idname\\s*(.*?)\\s*slug")) %>%
+  mutate(nov2020_location = nov2020_location_new[,2]) %>%
+  mutate(city = nov2020_location) %>%
+  mutate(nov2020_location_abbr = gsub("[^a-zA-Z]", "", location)) %>%
+  mutate(nov2020_abbr_new = str_match(nov2020_location_abbr, "state\\s*(.*?)\\s*type")) %>%
+  mutate(abbr = nov2020_abbr_new[,2]) %>%
+  mutate(time_period = rep("November 2020", 197842)) %>%
+  select(X1:usd_type, city, abbr, time_period)
+
+march2019_bool_cleaned %>%
+  select(category, city, abbr)
+```
+
+### Percentage of Successful and Failed Campaigns
+
+```{r}
+march2019_bool_cleaned %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n))
+
+nov2019_bool_cleaned %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n))
+
+march2020_bool_cleaned %>%
+  select(state) %>%
+  count(state) %>%
+  mutate(percentage = n/sum(n))
+
+nov2020_bool_cleaned %>%
+  select(state) %>%
+  count(state)%>%
+  mutate(percentage = n/sum(n))
+```
+
+### Difference in Average Goal Between Successful and Failed Campaigns
+
+```{r}
+march2019_bool %>%
+  select(state, goal) %>%
+  group_by(state) %>%
+  summarize(avg_goal = mean(goal))
+
+nov2019_bool %>%
+  select(state, goal) %>%
+  group_by(state) %>%
+  summarize(avg_goal = mean(goal))
+
+march2020_bool %>%
+  select(state, goal) %>%
+  group_by(state) %>%
+  summarize(avg_goal = mean(goal))
+
+nov2020_bool %>%
+  select(state, goal) %>%
+  group_by(state) %>%
+  summarize(avg_goal = mean(goal))
+```
+
+We initially anticipated seeing a decrease as unemployment numbers are rising, however we hypothesize that this increase in successful projects may be due to the higher amount of disposable income being saved by those who retained their jobs; by not going out as much, middle/higher income earners may be looking for new things to devote their free time to and may see these Kickstarter projects as new hobbies to take up during this time.
+
+Further investigating this research question, we decided to look at the average goal for all projects by month. What we found was that consistently across each month in both years, the average goal of failed projects was substantially higher than the average goal of successful projects. The output for this analysis can be found in Figure 4 in the Appendix. While the obvious reason for this is that the lower the project goal, the easier it is to reach that goal, there may be some psychological effect that a project’s goal plays on the individual. Even if someone might be very interested in a project, if they see that it has a high goal, they might consider it to be unrealistic and pointless to donate; therefore, projects with higher goals have even less of a chance of reaching that goal.
+
+### Success Rate by Campaign Category
+
+```{r message=FALSE}
+cat1 <- march2019_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(desc(success_rate))
+cat1_clean <- cat1[!duplicated(cat1$category),]
+print(cat1_clean, n=26)
+
+cat2 <- nov2019_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(desc(success_rate))
+cat2_clean <- cat2[!duplicated(cat2$category),]
+print(cat2_clean, n=31)
+
+cat3 <- march2020_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(desc(success_rate))
+cat3_clean <- cat3[!duplicated(cat3$category),]
+print(cat3_clean, n=29)
+
+cat4 <- nov2020_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(desc(success_rate))
+cat4_clean <- cat4[!duplicated(cat4$category),]
+print(cat4_clean, n=29)
+
+cat1_low <- march2019_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(success_rate)
+cat1_low_clean <- cat1_low[!duplicated(cat1_low$category),]
+print(cat1_low_clean, n=20)
+
+cat2_low <- nov2019_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(success_rate)
+cat2_low_clean <- cat2_low[!duplicated(cat2_low$category),]
+print(cat2_low_clean, n=20)
+
+cat3_low <- march2020_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(success_rate)
+cat3_low_clean <- cat3_low[!duplicated(cat3_low$category),]
+print(cat3_low_clean, n=20)
+
+cat4_low <- nov2020_bool_cleaned %>%
+  select(category, state) %>%
+  dplyr::group_by(category) %>%
+  mutate(success_rate = length(state[state == "successful"])/n()*100) %>%
+  mutate(num_projects=n()) %>%
+  select(category, success_rate, num_projects) %>%
+  arrange(success_rate)
+cat4_low_clean <- cat4_low[!duplicated(cat4_low$category),]
+print(cat4_low_clean, n=20)
+
+```
+
+```{r}
+library(png)
+library(knitr)
+img1_path <- "images/rank.png"
+include_graphics(img1_path)
+```
+
+
+We compared these lists to each other to get an idea of how successful or unsuccessful certain categories generally were month-to-month. From March 2020 to November 2020, the top categories that had the most dramatic positive change in success were “Children’s Books”, “Crafts”, “Fashion”, and “Video Games”. The top categories which had the most dramatic negative change in success were “Comic Books”, “Comics”, and “Tabletop Games”. There was no dramatic change in the lowest 20 categories, but it is interesting to note that for each month, “Mobile Games” was the lowest category.
+
+From this data, we may conclude that many of the categories with the lowest success rates fall into one of two general distinctions: tech, and niche interests. We believe that many tech projects fail because of the comprehension that is required to fully appreciate the utility of certain tech projects (softwares, web, mobile games, etc). Projects for niche interests also tend to fail more often due to the challenge of finding donors who share that interest; some examples of niche interest categories consistently found in the bottom 20 included bacon, flight, candles, farmers markets, food trucks, and interactive design). 
+
+We could also hypothesize that the category of successful projects is relevant to current societal events, such as the Coronavirus pandemic. As people quarantine and spend more and more time at home, they may find themselves trying to keep busy with things like fashion or video games, whilst also dealing with children being at home instead of school; this would explain the increase of successful children’s book and craft projects.
+
+### Sentiment Analysis of Campaign Blurbs
+
+```{r message=FALSE}
+march2019_sentiment <- march2019_bool_cleaned %>%
+  unnest_tokens(word, blurb) %>%
+  inner_join(get_sentiments("afinn"), by= "word") %>%
+  group_by(name) %>%
+  summarize(sentiment = mean(value), words = n()) %>%
+  ungroup()
+march2019_bool_cleaned %>%
+  inner_join(march2019_sentiment, by = "name") %>%
+  select(category, state, blurb, sentiment)
+march2019_graph <- march2019_bool_cleaned %>%
+  inner_join(march2019_sentiment, by = "name") %>%
+  select(state, sentiment)
+ggplot(march2019_graph, aes(sentiment, state)) + geom_boxplot()
+
+nov2019_sentiment <- nov2019_bool_cleaned %>%
+  unnest_tokens(word, blurb) %>%
+  inner_join(get_sentiments("afinn"), by= "word") %>%
+  group_by(name) %>%
+  summarize(sentiment = mean(value), words = n()) %>%
+  ungroup()
+nov2019_bool_cleaned %>%
+  inner_join(nov2019_sentiment, by = "name") %>%
+  select(category, state, blurb, sentiment)
+nov2019_graph <- nov2019_bool_cleaned %>%
+  inner_join(nov2019_sentiment, by = "name") %>%
+  select(state, sentiment)
+ggplot(nov2019_graph, aes(sentiment, state)) + geom_boxplot()
+
+march2020_sentiment <- march2020_bool_cleaned %>%
+  unnest_tokens(word, blurb) %>%
+  inner_join(get_sentiments("afinn"), by= "word") %>%
+  group_by(name) %>%
+  summarize(sentiment = mean(value), words = n()) %>%
+  ungroup()
+march2020_bool_cleaned %>%
+  inner_join(march2020_sentiment, by = "name") %>%
+  select(category, state, blurb, sentiment)
+march2020_graph <- march2020_bool_cleaned %>%
+  inner_join(march2020_sentiment, by = "name") %>%
+  select(state, sentiment)
+ggplot(march2020_graph, aes(sentiment, state)) + geom_boxplot()
+
+nov2020_sentiment <- nov2020_bool_cleaned %>%
+  unnest_tokens(word, blurb) %>%
+  inner_join(get_sentiments("afinn"), by= "word") %>%
+  group_by(name) %>%
+  summarize(sentiment = mean(value), words = n()) %>%
+  ungroup()
+nov2020_bool_cleaned %>%
+  inner_join(nov2020_sentiment, by = "name") %>%
+  select(category, state, blurb, sentiment)
+nov2020_graph <- nov2020_bool_cleaned %>%
+  inner_join(nov2020_sentiment, by = "name") %>%
+  select(state, sentiment)
+ggplot(nov2020_graph, aes(sentiment, state)) + geom_boxplot()
+
+
+if(!require(devtools)) install.packages("devtools")
+devtools::install_github("kassambara/ggpubr")
+
+mar19 <- ggplot(march2019_graph, aes(sentiment, state)) + geom_boxplot()
+nov19 <- ggplot(nov2019_graph, aes(sentiment, state)) + geom_boxplot()
+mar20 <- ggplot(march2020_graph, aes(sentiment, state)) + geom_boxplot()
+nov20 <- ggplot(nov2020_graph, aes(sentiment, state)) + geom_boxplot()
+
+library(ggpubr)
+ggarrange(mar19, nov19, mar20, nov20 + rremove("x.text"), 
+          labels = c("Mar 2019", "Nov 2019", "Mar 2020", "Nov 2020"),
+          ncol = 2, nrow = 2)
+```
+
+Here, we performed a sentiment analysis on the blurbs of Kickstarter projects. To do this, we started by unnesting the tokens in the blurb to create a vector of all words used in each blurb. From there, we performed an inner join with the “afinn” sentiment lexicon and the unnested blurbs and grouped those results by project name (“name” variable). We then summarized this variable with the “sentiment” value, which was defined as the mean sentiment values for all words in each blurb. This data was set to a new variable called “monthyear_sentiment”, with month and year pertaining to the respective values (“march2019_sentiment, etc.). From there, we created a variable in preparation for visualizing the sentiment scores called “monthyear_graph” which included the “monthyear_sentiment” data joining with the “monthyear_bool_cleaned data” and selecting only the “state” and “sentiment” columns.
+
+Using ggplot2’s boxplot, we were able to visualize the distribution of sentiment scores between both successful and unsuccessful projects. In doing this, we found that for all four months, the median sentiment score for successful projects was slightly higher than the median sentiment score for unsuccessful projects. Additionally, there was a more polarized distribution of sentiment scores within the failed projects, meaning that while successful projects had sentiment scores that were neither extremely positive nor negative, failed projects had sentiment scores that were very concentrated on either end of the plot. We realize that while a negative sentiment score does not necessarily indicate that a blurb was written with a negative or rude tone, it may indicate that using words with more negative connotations (even in a positive way) could lower the likelihood for that project to reach its goal.
+
+## Impact of Spotlight Pages
+
+```{r}
+march2019_spotlight <- march2019_bool_cleaned %>%
+  select(spotlight, usd_pledged) %>%
+  group_by(spotlight) %>%
+  mutate(mean_pledged = mean(usd_pledged)) %>%
+  select(spotlight, mean_pledged) %>%
+  group_by(spotlight)
+march2019_spotlight <- march2019_spotlight[!duplicated(march2019_spotlight$spotlight),]
+
+nov2019_spotlight <- nov2019_bool_cleaned %>%
+  select(spotlight, usd_pledged) %>%
+  group_by(spotlight) %>%
+  mutate(mean_pledged = mean(usd_pledged)) %>%
+  select(spotlight, mean_pledged) %>%
+  group_by(spotlight)
+nov2019_spotlight <- nov2019_spotlight[!duplicated(nov2019_spotlight$spotlight),]
+
+march2020_spotlight <- march2020_bool_cleaned %>%
+  select(spotlight, usd_pledged) %>%
+  group_by(spotlight) %>%
+  mutate(mean_pledged = mean(usd_pledged)) %>%
+  select(spotlight, mean_pledged) %>%
+  group_by(spotlight)
+march2020_spotlight <- march2020_spotlight[!duplicated(march2020_spotlight$spotlight),]
+
+nov2020_spotlight <- nov2020_bool_cleaned %>%
+  select(spotlight, usd_pledged) %>%
+  group_by(spotlight) %>%
+  mutate(mean_pledged = mean(usd_pledged)) %>%
+  select(spotlight, mean_pledged) %>%
+  group_by(spotlight)
+nov2020_spotlight <- nov2020_spotlight[!duplicated(nov2020_spotlight$spotlight),]
+
+march2019_spotlight
+nov2019_spotlight
+march2020_spotlight
+nov2020_spotlight
+```
+
+Here, we analyzed whether spotlight Kickstarter campaigns receive a higher “usd_pledged” amount. To do this, we calculated the average amount of “usd_pledged” for Kickstarter campaigns that were in the spotlight section of the website versus the campaigns that were not within the months of March and November of 2019 and 2020.
+
+Our research indicated that spotlight campaigns receive a higher amount pledged. All four months (March and November of 2019 and 2020) received between \$20,000-$21,000 more for utilizing the spotlight feature.
+
+# Findings and Implications
+
+The main findings from this analysis are as follows: while the average amount per pledge has decreased over the last two years, COVID-19 may have actually increased the popularity of certain campaign categories. Things like children’s books, crafts, and video games saw a major increase in successful campaigns over last year. Some categories, however, seem to be consistently less successful, regardless of outside factors. Specifically, the ‘Mobile Games’ category had the lowest number of successful projects across all four time periods. Included in these low-success categories are tech-oriented categories such as web, software, and apps, as well as categories with more niche interests like farmer’s markets, candles, and bacon. We can conclude from these findings that the more niche or advanced in nature a category is, the harder time it will have in securing funding.
+
+Lastly, our analysis leads us to believe that creating a “Spotlight” page for a Kickstarter campaign will play a major role in securing funding, as on average, campaigns with spotlight pages secure approximately $20,000 more in funding than campaigns without a spotlight page. This knowledge would benefit both Kickstarter and creators, as Kickstarter takes a small percentage of any successful projects, and projects are more likely to achieve more funding, and therefore, succeed with spotlight pages.
+
+
+
+
+
+
+
+
+
+
+
+
+
