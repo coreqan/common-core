@@ -1,0 +1,1028 @@
+---
+title: "Using Supervised Learning to Investigate My Spotify Library"
+author: "Conor O'Regan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align="center", cache=TRUE)
+```
+
+```{r PACKAGES, include=FALSE}
+library(tidyverse)
+library(spotifyr)
+library(plotly)
+library(neuralnet)
+library(genius)
+library(tidytext)
+library(textdata)
+library(igraph)
+library(ggraph)
+library(widyr)
+library(kableExtra)
+library(MASS) 
+library(ISLR) 
+library(factoextra)
+library(cluster)
+library(klaR)
+library(dendextend)
+library(dbscan)
+library(topicmodels)
+library(flexmix)
+library(ellipse)
+library(mclust)
+library(FactoMineR)
+library(caret)
+```
+
+```{r authentication, include=FALSE}
+#these commands are to authenticate with the spotify API, which requires the user to sign up for a spotify developer account
+Sys.setenv(SPOTIFY_CLIENT_ID = 'my_client_id_here')
+Sys.setenv(SPOTIFY_CLIENT_SECRET = 'my_client_secret_here')
+
+access_token <- spotifyr::get_spotify_access_token()
+
+my_id <- "my_spotify_id_here"
+
+
+
+#reading .rds files after running code for the first time
+#drastically cuts down on runtime
+#many of these functions work with APIs and take a lot of time to pull data
+#saving objects as .rds files allows us to not need to run API queries every time we clear the environment
+#these .rds files stay in the working directory and allow us to load in the objects directly
+liked_songs <- read_rds('liked_songs.rds')
+liked_albums <- read_rds('liked_albums.rds')
+album_tracks <- read_rds('album_tracks.rds')
+albums_list <- read_rds("albums_list.rds")
+data <- read_rds("spotify_data.rds")
+lyrics <- read_rds("lyrics.rds")
+tracks_features <- read_rds("tracks_features.rds")
+tracks_features2 <- read_rds("tracks_features2.rds")
+```
+
+# Introduction
+
+This project was conducted mostly using [Spotify's Web API](https://developer.spotify.com/documentation/web-api/), the [spotifyr](https://github.com/charlie86/spotifyr) package developed by GitHub user charlie86, the [genius](https://github.com/JosiahParry/genius) package developed by GitHub user JosiahPerry,and ideas based off the methodologies of others who have explored their own Spotify data, including [Mia Smith](https://msmith7161.github.io/what-is-speechiness/) and [Han Chen](https://rpubs.com/womeimingzi11/how_my_spotify_looks_like).
+
+What initially inspired this project was a curiousity about how accurately Spotify's personalization algorithm was working within the Discover Weekly playlist that was generated for me each week. In developing an unsupervised learning model to predict whether or not I liked a song based on the audio features of a track, I would inadvertently see how many of the 30 songs within the Discover Weekly playlist I actually liked. Outside of this goal, I was also able to perform some EDA including Principal Component Analysis, Sentiment Analysis of lyrical content, Topic Modeling, and the creation of a Bigram Network.
+
+My Spotify profile is a bit of a mess, and I save songs in a variety of ways. To be able to analyze my full library, I wanted to not only use tracks that I had saved to the 'Liked Songs' playlist, but also any track that is part of an album that I had liked as well (these are two entirely different entities within a Spotify profile). As a result, I used the 'get_my_saved_tracks' function to pull data on any songs from the 'Liked Songs' playlist, and then used a combination of the 'get_my_saved_albums' and 'get_album_tracks' functions to pull data from every song in all of my saved albums.
+
+# Setup/Loading Data
+
+The Spotify API limits requests to 50 at a time; we can write a function in R to reiterate the request for every 50 entries using the 'offset' argument. This will pull saved tracks in batches of 50 until all tracks in the 'Liked Songs' playlist have been pulled. 
+
+We also save these objects as .rds files so that each time the environment is cleared, we can just have R read in the .rds objects rather than running the API request each time (these API requests can take quite a lot of time, so this will prove to be helpful in the long term).
+
+```{r importing my liked songs, eval=FALSE}
+liked_songs <-
+  ceiling(get_my_saved_tracks(include_meta_info = TRUE)[['total']] / 50) %>%
+  seq() %>%
+  map(function(x) {
+    get_my_saved_tracks(limit = 50, offset = (x - 1) * 50)
+  }) %>% reduce(rbind) %>%
+  write_rds('liked_songs.rds')
+```
+
+```{r, echo=FALSE}
+glimpse(liked_songs)
+```
+
+Next, we will want to pull all albums that I have saved in my library.
+
+```{r importing my saved albums, eval=FALSE}
+#list of all albums I have saved in my library
+liked_albums <-
+  ceiling(get_my_saved_albums(include_meta_info = TRUE)[['total']] / 50) %>%
+  seq() %>%
+  map(function(x) {
+    get_my_saved_albums(limit = 50, offset = (x - 1) * 50)
+  }) %>% reduce(rbind) %>%
+  write_rds('liked_albums.rds')
+```
+
+```{r, echo=FALSE}
+glimpse(liked_albums)
+```
+
+From this list of albums, we want to use the get_album_tracks() function to pull all tracks from each album.
+
+```{r tracks from saved albums, eval=FALSE}
+#generating all tracks from my saved albums
+album_ids <- liked_albums %>%
+  select(album.id)
+
+album_tracks <- 
+  ceiling(get_my_saved_albums(include_meta_info = TRUE)[['total']]) %>%
+  seq() %>%
+  map(function(x) {
+    get_album_tracks(id = album_ids[x,])
+  }) %>% reduce(rbind) %>%
+  write_rds('album_tracks.rds')
+```
+
+```{r, echo=FALSE}
+glimpse(album_tracks)
+```
+
+We will also want to grab the album name and the artist name for a later analysis.
+
+```{r cleaning data, eval=FALSE}
+albums <- as.data.frame(liked_albums[,c(3,11)])
+albums <- albums %>%
+  unnest()
+albums <- albums[,c(3,7)]
+albums <- rename(albums, artist=name, album=album.name)
+albums <- albums[!duplicated(albums$album),]
+albums %>%
+  write_rds("albums_list.rds")
+```
+
+Next, I performed some standard data cleansing (renaming variables, selecting only variables of interest, reordering the dataset, etc.).
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+#cleaning album_tracks (renaming variables, consolidating dataset, etc.)
+album_tracks <- album_tracks[,c(1, 4, 5, 7, 9)]
+album_tracks <- rename(album_tracks, track_id = id)
+
+album_tracks <- album_tracks %>%
+  unnest()
+
+album_tracks <- album_tracks[!duplicated(album_tracks$track_id),]
+
+album_tracks <- album_tracks[,c(2,3,7:10)]
+album_tracks <- rename(album_tracks, artist_id=id, artist_name = name, track_name = name1)
+
+#cleaning liked_songs
+liked_songs <- liked_songs[,c(2, 5, 6, 8, 10)]
+liked_songs <- rename(liked_songs, track_id = track.id, track_name=track.name)
+
+liked_songs <- liked_songs %>%
+  unnest()
+
+liked_songs <- liked_songs[!duplicated(liked_songs$track_id),]
+
+liked_songs <- liked_songs[,c(2, 3, 7:10)]
+liked_songs <- rename(liked_songs, artist_id=id, artist_name=name, duration_ms = track.duration_ms, explicit = track.explicit)
+
+all_tracks <- rbind(album_tracks, liked_songs)
+all_tracks <- all_tracks[,c(5, 6, 2, 1, 3, 4)]
+head(all_tracks)
+```
+
+When generating audio features for a track, the Spotify API only allows for 100 tracks to have their features pulled at a single time. In a similar fashion to before, we can iterate through my library one song at a time to obtain the audio features for all tracks in the datset. This is definitely not the most optimal way to perform this task!
+
+```{r generating audio feature information for each track, eval=FALSE}
+get_features <- function(all_tracks) {
+    get_track_audio_features(all_tracks$track_id)
+}
+track_features <- all_tracks %>%
+  group_split(track_id) %>%
+  map_dfr(get_features)
+
+#join track features and song catalog information
+track_features <- rename(track_features, track_id=id)
+track_features <- track_features[,c(1:11, 13)]
+track_features <- distinct(track_features)
+data <- all_tracks %>%
+  left_join(track_features, by="track_id")
+
+data %>%
+  write_rds("spotify_data.rds")
+```
+
+This will be our final dataset which we will perform EDA on in the next section of this project:
+
+```{r, echo=FALSE}
+glimpse(data)
+```
+
+# Exploratory Data Analysis
+
+## Principal Component Analysis
+
+I'm using numeric-only data (which is also used for clustering) to perform the PCA.
+
+```{r}
+data_clustering <- data[,c(5:17)]
+data_clustering$explicit <- ifelse(data_clustering$explicit==TRUE, 1, 0)
+
+spotify.pca = prcomp(data_clustering, scale=TRUE, center=TRUE)
+summary(spotify.pca) 
+
+fviz_eig(spotify.pca)
+
+spotify.small <- data_clustering[1:25,]
+spotify.fm=PCA(spotify.small)
+
+fviz_pca_var(spotify.fm, col.var="contrib", gradient.cols=c("#bb2e00", "#002bbb"), repel=TRUE)
+
+fviz_contrib(spotify.fm, choice = "var")
+```
+
+One interesting insight from this PCA is that the variables which contribute most to the variability of my data are energy and acousticness, which I found particularly interesting because of how nearly opposite they are. I interpret this to mean that I like songs which are either very high energy or very soft and acoustic.
+
+## A Look at My Top Artists
+
+To start my EDA, I was interested in  which artists I have the most songs saved compared against who Spotify considers my top artists right now. Within the data, there are some duplicate values; I'm assuming tracks with features may show up more than once.
+
+```{r, warning=FALSE, message=FALSE}
+data <- data[!duplicated(data$track_name),]
+data %>%
+  dplyr::select(artist_name) %>%
+  group_by(artist_name) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  top_n(10)
+
+top_artists <- spotifyr::get_my_top_artists_or_tracks(type="artists", limit = 10)
+top_artists <- as_tibble(top_artists[,5])
+top_artists <- rename(top_artists, artist_name=value)
+top_artists
+```
+
+Unsurprisingly to me, the 10 artists whose songs I have saved the most of are all rap or hip/hop artists. These may not be my most played artists (especially as of recent), but as hip/hop is probably the genre which I listen to most often, this makes sense.
+
+## A Deeper Look into Track Valence and Energy
+
+I wanted to check out the 'valence' and 'energy' variables which were a part of the audio features from Spotify's API. Valence is a measure of musical "positivity". I wanted to cherry-pick some artists that I thought would showcase these measures accurately.
+
+```{r, warning=FALSE, message=FALSE}
+#investigating the energy and valence variables, determined by Spotify
+data_energy_focus <- data %>%
+  dplyr::filter(artist_name == "Bon Iver" | artist_name == "PUP" | artist_name == "Mac DeMarco" | artist_name == "Anderson .Paak")
+
+ggplot(data = data_energy_focus, aes(x = valence, y = energy, color = artist_name)) +
+  geom_jitter() +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+```
+
+Bon Iver's music tends to have low energy and low valence, which one could hear from the intimate, brittle falsetto over yearning acoustic guitar and ghostly synths (see [Michicant](https://open.spotify.com/track/0oirMI8pqPHJiJFTX1LhKh?si=390ca4b3d7e84940), [29 #Strafford APTS](https://open.spotify.com/track/4VZM71F8XAoLRuNyNLxwWS?si=9c33f6f2e15a477d), and [Marion](https://open.spotify.com/track/6eICehJWzcEk2880W6Apif?si=91c5ad889519471b)).
+
+Anderson .Paak's exuberence shines through with his generally high energy, high valence grooves (see [Heart Don't Stand a Chance](https://open.spotify.com/track/25GlFJq5QNAXyVgJvCZ4Mf?si=55de47fe42594cd7), [Make It Better](https://open.spotify.com/track/4SBVWkRIMJ6WBCYPvr5Bwr?si=5c192c247f184284), and [Tints](https://open.spotify.com/track/7c3SbTuufigBWURcICnAWy?si=6df382d2a2d34c4a)).
+
+PUP's nihilism, anger, and love of all things loud produces high energy, low valence explosions of noise (see [Anaphylaxis](https://open.spotify.com/track/1Z6zwgVuT2ytuP2GWszvZ6?si=34fd6122233f49c3), [Morbid Stuff](https://open.spotify.com/track/0A31i51V3omHTJMDCJxDfh?si=80adfe3445ee48f4), and [Full Blown Meltdown](https://open.spotify.com/track/5pyXMKcD2WHuzCuRczcXpw?si=a34b2f01be6f4ac5)).
+
+Lastly, Mac DeMarco's laid-back, lazy sound leads to a pretty significant variance in valence and energy (see [Ode to Viceroy](https://open.spotify.com/track/601KiLiZtBJRTXBrTjeieP?si=5c6c541bbe2c485d), [Goodbye Weekend](https://open.spotify.com/track/6yFNMQrUVlg9Uqo0qRzGOD?si=749045038a444fec), and [This Old Dog](https://open.spotify.com/track/1KTMZ2DeqT4oqIJ7Co5F6R?si=b53f35dec9854e90)).
+
+## Small Samples of Specific Genres
+
+To investigate the average valence and energy measurements of specific artists, I first used dplyr's summarize to calculate the means of these two variables.
+
+```{r, warning=FALSE, message=FALSE}
+#calculating average energy and valence by artist
+data_valence <- data %>%
+  dplyr::select(artist_name, valence, energy) %>%
+  group_by(artist_name) %>%
+  summarize(avg_valence = mean(valence), avg_energy = mean(energy))
+```
+
+### Hip-Hop
+
+The first genre whose valence and energy I wanted to investigate was hip-hop. There are obviously too many artists to highlight all hip-hop artists in my library, so I chose to highlight a select few that I personally was curious to know about.
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#investigating hip/hop artists
+focus_energy_hiphop <- data_valence %>%
+  filter(artist_name == "Kanye West" | artist_name == "Benny The Butcher" | artist_name == "JID" | artist_name == "Pusha T" | artist_name == "Kendrick Lamar" | artist_name == "Drake")
+data_valence %>%
+  ggplot(aes(x = avg_valence, y=avg_energy)) + geom_point(alpha=0.3) + geom_point(data=focus_energy_hiphop, aes(x=avg_valence, y=avg_energy, color=artist_name), size=3) +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+```
+
+In looking at some of the hip/hop artists I have been listening to recently, their music tends to be more on the higher energy, lower valence.
+
+### RnB
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#investigating rnb artists
+focus_energy_rnb <- data_valence %>%
+  filter(artist_name == "Frank Ocean" | artist_name == "SZA" | artist_name == "Miguel" | artist_name == "Anderson .Paak" | artist_name == "Daniel Caesar" | artist_name == "Snoh Aalegra")
+data_valence %>%
+  ggplot(aes(x = avg_valence, y=avg_energy)) + geom_point(alpha=0.3) + geom_point(data=focus_energy_rnb, aes(x=avg_valence, y=avg_energy, color=artist_name), size=3) +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+```
+
+In looking at some of the RnB artists I have been listening to recently, their music tends to have slightly lower energy and lower valence.
+
+### Rock/Punk
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#investigating rock artists
+focus_energy_rock <- data_valence %>%
+  filter(artist_name == "PUP" | artist_name == "Catfish and the Bottlemen" | artist_name == "Jeff Rosenstock" | artist_name == "Origami Angel" | artist_name == "Arctic Monkeys" | artist_name == "Cage The Elephant")
+data_valence %>%
+  ggplot(aes(x = avg_valence, y=avg_energy)) + geom_point(alpha=0.3) + geom_point(data=focus_energy_rock, aes(x=avg_valence, y=avg_energy, color=artist_name), size=3) +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+```
+
+In looking at some of the rock or punk artists I have been listening to recently, their music tends to have higher energy and lower valence.
+
+### Singer/Songwriter
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#investigating singer/songwriters
+focus_energy_singer <- data_valence %>%
+  filter(artist_name == "Bruno Major" | artist_name == "Lizzy McAlpine" | artist_name == "Rosie Carney" | artist_name == "Bon Iver" | artist_name == "Hozier" | artist_name == "cehryl")
+data_valence %>%
+  ggplot(aes(x = avg_valence, y=avg_energy)) + geom_point(alpha=0.3) + geom_point(data=focus_energy_singer, aes(x=avg_valence, y=avg_energy, color=artist_name), size=3) +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+```
+
+Most of the singer/songwriters that I have been listening to recently, artists tends to produce lower energy, lower valence music.
+
+### All Artists (Interactive)
+
+Lastly, I wanted to develop a large-scale, interactive plot of all artists in my library and their average energy/valence using the 'plotly' package.
+
+```{r, warning=FALSE, message=FALSE}
+#full interactive plot
+scatterPlot <- data_valence %>%
+ggplot(aes(x = avg_valence, y=avg_energy, text = paste("Artist: ", artist_name, "\n", "Average Valence: ", round(avg_valence, 2), "\n", "Average Energy: ", round(avg_energy, 2), sep = ""))) + geom_point(alpha=0.3) +
+  geom_vline(xintercept = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  annotate('text', 0.25 / 2, 0.95, label = "Turbulent/Angry", fontface =
+             "bold") +
+  annotate('text', 1.75 / 2, 0.95, label = "Happy/Joyful", fontface = "bold") +
+  annotate('text', 1.75 / 2, 0.05, label = "Chill/Tranquil", fontface =
+             "bold") +
+  annotate('text', 0.25 / 2, 0.05, label = "Sad/Depressing", fontface =
+             "bold") + 
+  theme_bw()
+
+plotly::ggplotly(scatterPlot, tooltip = "text")
+```
+
+### Speechiness of Rappers
+
+Delving deeper into hip-hop, I wanted to check out the 'speechiness' variable and how it relates to who I consider some of the wordiest rappers that I listen to. 
+
+Spotify says that "speechiness detects the presence of spoken words in a track. The more exclusively speech-like the recording (e.g. talk show, audio book, poetry), the closer to 1.0 the attribute value. Values above 0.66 describe tracks that are probably made entirely of spoken words. Values between 0.33 and 0.66 describe tracks that may contain both music and speech, either in sections or layered, including such cases as rap music. Values below 0.33 most likely represent music and other non-speech-like tracks."
+
+```{r, investigating speechiness between wordy rappers, echo=FALSE}
+data_rappers <- data %>%
+  dplyr::select(artist_name, speechiness) %>%
+  dplyr::filter(artist_name == "Action Bronson" | artist_name == "Madvillain" | artist_name == "JID" | artist_name == "MAVI")
+
+ggplot(data_rappers, aes(x=speechiness, fill=artist_name,
+                    text = paste(artist_name)))+
+  geom_density(alpha=0.5, color=NA)+
+  geom_vline(xintercept=0.33) +
+  geom_vline(xintercept=0.66) +  
+  scale_fill_manual(values=c('green', 'yellow', 'pink', 'blue', 'orange'))+
+  labs(x="Speechiness", y="Density") +
+  guides(fill=guide_legend(title="Artist"))+
+  theme_minimal()+
+  ggtitle("Distribution of Speechiness Between Rappers")
+```
+
+I was slightly surprised at the results, expecting the distribution maxima to be slightly higher that they were. That being said, there are some tracks from these artists that have a much higher 'speechiness' than average.
+
+## Sentiment Analysis of Lyrics
+
+I wanted to investigate the sentiment of my Spotify library's lyrics. To do this, I used the 'genius' package developed by JosiahPerry (more info can be found [here](https://github.com/JosiahParry/genius)).
+
+First, I needed to create a list of all artists and album names for the package to be able to iterate through by reading the album name, grabbing all song titles from that album, and returning the lyrics from each song within a tibble. We did this as part of the 'Setup' section, and wrote a .rds file called 'albums_list'.
+
+```{r, warning=FALSE, error=FALSE, eval=FALSE}
+albums_list <- read_rds("albums_list.rds")
+albums_list <- as_tibble(albums_list)
+
+lyrics <- albums_list %>%
+ add_genius(artist, album, type="album") %>%
+  write_rds("lyrics.rds")
+```
+
+```{r}
+head(lyrics[,c(6, 4, 5)])
+song_lyrics <- lyrics %>% 
+     group_by(track_title) %>% 
+     mutate(song_lyrics = paste0(lyric, collapse = " ")) %>%
+  dplyr::select(artist, album, track_title, song_lyrics)
+song_lyrics <- song_lyrics[!duplicated(song_lyrics$track_title),]
+head(song_lyrics[,c(3,4)])
+```
+
+From here, we can continue with a sentiment analysis based on the 'lyric' column. Unfortunately, there were some albums which the 'genius' package could not return the lyrics for. I am attributing this to some kind of discrepancy that may have arose when searching for album or artist name when they are classified slightly differently within Genius's database. Regardless, for the purpose of this project, the number of songs whose lyrics were successfully returned should be adequate. Additionally, for any artists or albums I want to isolate for an analysis, I can simply rerun the 'add_genius' command while specifying the artist and album name.
+
+I started this sentiment analysis by tokenizing all song lyrics by word.
+
+```{r sentiment analysis, warning=FALSE, message=FALSE}
+#tokenizing 'lyrics' tibble
+text_df=tibble(line=1:nrow(song_lyrics), text=song_lyrics$song_lyrics)
+
+text_tidy=text_df %>%
+  unnest_tokens(word, text)
+
+text_tidy = text_tidy %>%
+  anti_join(stop_words)
+```
+
+From here, I filtered out some choice expletives and went ahead with performing a word count on all lyrics in my library, as well as a count of total instances of each sentiment score.
+
+```{r custom stop words, echo=FALSE}
+#custom stop words (keeping things rated T)
+custom_stop_words <- tribble(
+  ~word, ~lexicon,
+  "nigga", "CUSTOM",
+  "niggas", "CUSTOM"
+)
+
+stop_words <- stop_words %>% 
+  bind_rows(custom_stop_words)
+```
+
+```{r, warning=FALSE, message=FALSE}
+#using afinn
+#joining data with sentiments
+sentiment_text = text_tidy %>%
+  inner_join(get_sentiments("afinn")) %>%
+  anti_join(stop_words)
+
+#counting sentiments
+sentiment_text %>%
+  count(value)
+
+sentiment_text %>%
+  count(word, value) %>%
+  arrange(desc(n))
+```
+
+Following this word count, I wanted to plot the top 5 words from each sentiment score.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#plotting sentiment
+sent_count =  sentiment_text %>%
+  count(word, value) %>%
+  group_by(value) %>%
+  top_n(5, n) %>%
+  ungroup() %>%
+  mutate(word2=fct_reorder(word, n))
+
+ggplot(sent_count, aes(x=word2, y=n, fill=value)) +
+  geom_col(show.legend=FALSE)+
+  facet_wrap(~value, scales="free")+
+  coord_flip()+
+  labs(title = "Sentiment Word Counts", x="Words")
+```
+
+One interesting point of this visualization is just how few words with a sentiment score of +5 are said within the thousands of songs in my library. By far the most popular word is 'yeah' with a sentiment score of +1, followed closely by 'love' with a score of +3. It is also worth noting that the word counts of words with a negative sentiment is generally much higher than the word count of positive words.
+
+## Bigram Network
+
+I wanted to investigate the most popular two-word phrases that were used in my library. To do this, I first split each song into groups of two and three words.
+
+```{r investigating popular phrases}
+#splitting each song into groups of two words
+bigram=song_lyrics[,"song_lyrics"]
+
+ngram_titles2 = bigram %>%
+  unnest_tokens(bigram, song_lyrics, token="ngrams", n=2)
+head(ngram_titles2)
+```
+
+After splitting each song into groups of two, we could conduct a count to see which phrases are said most often in songs.
+
+```{r}
+#counting two-word groups
+ngram_titles2 %>%
+  count(ngram_titles2$bigram, sort=TRUE)
+```
+
+I wanted to be sure to exclude any common stop words, which was done here:
+
+```{r}
+#eliminating stop words
+filtered_titles2 = ngram_titles2 %>%
+  separate(bigram, c("word1", "word2"), sep=" ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)
+
+#uniting separated words back into groups of two
+filtered_titles_united2 = filtered_titles2 %>%
+  unite(bigram, c("word1", "word2"), sep=" ") 
+
+filtered_titles_united2 %>%
+  count(bigram, sort=TRUE)
+```
+
+As funny as this list is to look at, it doesn't provide a whole lot of insight into what these artists are actually singing or rapping about in their songs; to address this, I decided to add all of these ad-lib style words to a custom list of stop words.
+
+```{r, echo=FALSE}
+custom_stop_words <- tribble(
+  ~word, ~lexicon,
+  "nigga", "CUSTOM",
+  "niggas", "CUSTOM",
+    "yeah", "CUSTOM",
+    "la", "CUSTOM",
+    "ooh", "CUSTOM",
+    "da", "CUSTOM",
+    "na", "CUSTOM",
+    "boom", "CUSTOM",
+    "ayy", "CUSTOM",
+    "ah", "CUSTOM",
+    "uh", "CUSTOM",
+    "woah", "CUSTOM",
+    "hey", "CUSTOM",
+    "huh", "CUSTOM",
+    "whoa", "CUSTOM",
+    "mm", "CUSTOM",
+    "mmm", "CUSTOM",
+    NA, "CUSTOM",
+    "nah", "CUSTOM",
+    "doot", "CUSTOM",
+  "woo", "CUSTOM",
+  "yah", "CUSTOM",
+  "ha", "CUSTOM",
+  "skrrt", "CUSTOM",
+  "ahh", "CUSTOM",
+"ey", "CUSTOM",
+"doo", "CUSTOM",
+"ay", "CUSTOM"
+)
+
+stop_words2 <- stop_words %>% 
+  bind_rows(custom_stop_words)
+
+#eliminating stop words
+filtered_titles2 = ngram_titles2 %>%
+  separate(bigram, c("word1", "word2"), sep=" ") %>%
+  filter(!word1 %in% stop_words2$word) %>%
+  filter(!word2 %in% stop_words2$word)
+
+#uniting separated words back into groups of two
+filtered_titles_united2 = filtered_titles2 %>%
+  unite(bigram, c("word1", "word2"), sep=" ") 
+
+filtered_titles_united2 %>%
+  count(bigram, sort=TRUE)
+```
+
+While I definitely didn't manage to filter out all nonsensical words, I thought this was a much more insightful list of bigram pairs than the last. My next step was plotting these pairs as a bigram network.
+
+```{r, warning=FALSE, message=FALSE}
+#creating bigram network
+bigram_count2=filtered_titles2 %>%
+  count(word1, word2, sort=TRUE)
+bigram_network2 = bigram_count2 %>%
+  filter( n > 2) %>%
+  top_n(n=70)  %>%
+  graph_from_data_frame()
+bigram_network2
+
+#plotting bigram network
+set.seed(123)
+ggraph(bigram_network2, layout = "fr") +
+  geom_edge_link() +
+  geom_node_point() +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+```
+
+# Clustering
+## Topic Modeling
+
+I started the topic modeling process by tokenizing each word from the 'song_lyrics' data frame and creating a Tf Matrix.
+
+```{r, message=FALSE, warning=FALSE}
+lyric_tokens =  song_lyrics %>%
+  unnest_tokens(output=word, token = "words", input = song_lyrics) %>%
+  anti_join(stop_words2)
+
+lyric_matrix = lyric_tokens %>%
+  count(track_title, word) %>%
+  cast_dtm(document=track_title, term=word, 
+           value=n, weighting=tm::weightTf)
+```
+
+After redefining the data as a Tf Matrix, I used the LDA function on that matrix with a k-value of 2 to separate each document (in our case, each song) into one of two algorithmically defined topics.
+
+```{r}
+lyric_lda=LDA(lyric_matrix, k=2, control=list(seed=1234))
+
+lda_topics=tidy(lyric_lda, matrix="beta")
+
+lda_top_terms = lda_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta)%>%
+  ungroup() %>%
+  arrange(topic, beta)
+
+lda_top_terms %>%
+  mutate(term=reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill=factor(topic))) + 
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free") +
+  coord_flip()
+```
+
+When performing topic modeling, the topics are not actually defined or titled; they are completely up to the interpretation of the user. Based on the top 10 words from each topic, I hypothesize the two types of songs were songs related to love and songs *not* related to love.
+
+# Mixture Model
+
+A mixture model is a mixture of $k$ component distributions that collectively make a mixture distribution, for example:
+
+$f(x) = \pi f_1 (x) + (1- \pi) f_2 (x)$
+
+Here, $\pi$ represents the mixing weight of the first component and $f(x)$ represents the two component mixture distribution.
+
+To accomplish this, we will first create a subset of the data that only includes numerical values:
+
+```{r}
+#keeping only numeric data for clustering purposes
+#also converting 'explicit' from TRUE/FALSE to binary
+data_clustering <- data[,c(5:17)]
+data_clustering$explicit <- ifelse(data_clustering$explicit==TRUE, 1, 0)
+```
+
+## Univariate Model - Valence
+
+```{r}
+#observing distribution of valence
+ggplot(data_clustering, aes(x = valence)) +
+  geom_histogram(bins=40) 
+
+#creating flexmix model
+set.seed(123)
+model1=flexmix(valence~1, data=data_clustering, k=1, model= FLXMCnorm1(),control=list(tol=1e-15, verbose =1, iter=1e4))
+
+#plotting histogram and density
+#proportion function
+fun_prop=function(x, mean, sd, proportion){
+  proportion * dnorm(x = x, mean = mean, sd = sd)
+}
+
+#saving args from model
+comp_1=parameters(model1, component=1)
+proportions=prior(model1)
+
+#plotting histogram and density
+ggplot(data_clustering) + geom_histogram(aes(x = valence, y = ..density..), bins=40) + 
+  stat_function(geom = "line", fun = fun_prop, 
+                args = list(mean = comp_1[1], sd = comp_1[2], 
+                proportion = proportions[1]))
+```
+
+We have successfully plotted a generally normal distribution of the 'valence' variable.
+
+## Bivariate Model - Energy and Danceability
+
+```{r, warning=FALSE, message=FALSE}
+#distribution of energy
+ggplot(data_clustering, aes(x = energy)) +
+  geom_histogram() 
+
+#distribution of danceability
+ggplot(data_clustering, aes(x = danceability)) +
+  geom_histogram() 
+```
+
+```{r, results='hide'}
+#creating bivariate flexmix model
+model2 = flexmix(cbind(energy, danceability)~1, k=2,
+                 data=data_clustering,
+                 model=FLXMCmvnorm(diag=FALSE),
+                 control=list(tol=1e-15,verbose =1,iter=1e4))
+```
+
+```{r message=FALSE, warning=FALSE}
+#visualizing clusters for two variables
+#components
+comp_1 <- parameters(model2, component = 1)
+comp_2 <- parameters(model2, component = 2)
+
+#means of components
+mean_comp_1 <- comp_1[1:2]
+mean_comp_2 <- comp_2[1:2]
+
+#covariance matrices of components
+covariance_comp_1 <- matrix(comp_1[3:6], nrow = 2)
+covariance_comp_2 <- matrix(comp_2[3:6], nrow = 2)
+
+#ellipse 1
+ellipse_comp_1 <- ellipse(x = covariance_comp_1, centre = mean_comp_1,
+                          npoints = nrow(data_clustering))
+
+#ellipse 2
+ellipse_comp_2 <- ellipse(x = covariance_comp_2, centre = mean_comp_2,
+                          npoints = nrow(data_clustering))
+
+data_clustering %>% 
+  ggplot(aes(x = energy, y = danceability)) + geom_point()+
+  geom_path(data = data.frame(ellipse_comp_1), aes(x=x,y=y), col = "red") +
+  geom_path(data = data.frame(ellipse_comp_2), aes(x=x,y=y), col = "blue")
+```
+
+
+
+
+# Supervised Learning
+
+As I mentioned in the Introduction, the main goal of this project was to see if I could create an algorithm that could correctly predict whether or not I liked a song based on the audio features provided. To do this, I needed to use not only songs that I liked (from my saved albums, liked songs, etc.), but also songs that I didn't like. To start this process, I created a playlist of songs that I did not like that would then be incorporated into the dataset. From there, I will use the data as a training set, and my personalized 'Discover Weekly' playlist as a test set. I will then listen to my Discover Weekly playlist, note which songs I like and which songs I don't like, and compare the performance of the model.
+
+## Data Setup
+```{r, warning=FALSE, message=FALSE}
+#spotifyr::get_playlist_tracks("4ISw66mIYAdbeZb9qcrrSP") # bad playlist (training set 1/2)
+#spotifyr::get_playlist_tracks("01rfBVllJPvMN2F9og8OJ2") # good playlist (training set 2/2)
+#spotifyr::get_playlist_tracks("4dlSC6KNm5MfAEsgeZgjed") # discover weekly (test set)
+
+tracks1 <- spotifyr::get_playlist_tracks("4ISw66mIYAdbeZb9qcrrSP") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+
+tracks2 <- spotifyr::get_playlist_tracks("01rfBVllJPvMN2F9og8OJ2") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+#random sample so like/dislike ratio is even 1:1
+set.seed(123)
+tracks2_list <- sample(c(1:100), 63, replace=FALSE)
+tracks2 <- tracks2[tracks2_list,]
+
+tracks3 <- spotifyr::get_playlist_tracks("4dlSC6KNm5MfAEsgeZgjed") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+
+tracks <- rbind(tracks1, tracks2, tracks3)
+```
+
+This object 'tracks' now includes 63 of my top 100 songs from 2020, 63 songs I have explicity chosen because I don't like them, and 30 songs from my Discover Weekly playlist for the week of April 19, 2020. My next objective was to retrieve the audio features for these songs; the methodology was nearly identical to getting audio features in previous sections.
+
+```{r, eval=FALSE}
+get_features <- function(tracks) {
+    get_track_audio_features(tracks$track.id)
+}
+tracks_features <- tracks %>%
+  group_split(track.id) %>%
+  map_dfr(get_features) %>%
+  write_rds("tracks_features.rds")
+```
+
+```{r, warning=FALSE, message=FALSE}
+tracks_features <- read_rds('tracks_features.rds')
+tracks_features <- dplyr::rename(tracks_features, track_id = id)
+tracks_features <- tracks_features[,c(1:11, 13)]
+
+tracks <- tracks %>%
+  unnest()
+tracks <- tracks[!duplicated(tracks$track.id),]
+
+tracks <- tracks[,c(1, 3, 4, 8, 9, 10, 11)]
+tracks <- dplyr::rename(tracks, artist_id = id, track_id = track.id, artist_name = name, duration_ms = track.duration_ms, explicit = track.explicit, track_name = track.name, album_id = track.album.id)
+
+tracks <- tracks %>%
+  left_join(tracks_features, by="track_id")
+
+tracks <- tracks[,c(1, 6, 2, 3, 4, 5, 8:18, 7)]
+
+head(tracks)
+```
+
+Lastly, I needed to create a new binary variable called 'target', whose value will equal 1 if I like the song and 0 if I do not like the song. I also took this time to convert the 'explicit' variable from TRUE/FALSE to 1/0 to keep things numeric.
+
+```{r}
+#target variable
+#1 if i like the song, 0 if i do not like the song
+target <- c(rep(0, 63), rep(1, 63), rep(NA, 30))
+tracks <- cbind(tracks, target)
+
+tracks$explicit <- ifelse(tracks$explicit==TRUE, 1, 0)
+```
+
+## Neural Network
+
+Generally, it is a good idea to scale data for a neural network, which is what I did here:
+
+```{r, scaling data}
+#scaling data
+maxs=apply(tracks[,5:17], 2, max)
+mins=apply(tracks[,5:17], 2, min)
+tracks.sd <- as.data.frame(scale(tracks[,5:17],center = mins, scale = maxs - mins))
+tracks.sd = cbind(tracks$target,tracks.sd)
+tracks.sd <- dplyr::rename(tracks.sd, target = "tracks$target")
+```
+
+Because I know which songs I am treating as my test and train set, I manually defined which rows are a part of which set.
+
+```{r, test/train split}
+#test/train split
+test <- tracks.sd[127:156,]
+train <- tracks.sd[1:126,]
+```
+
+To avoid writing out all variable names as part of the neuralnet function, I created a simple formula that will paste the variable names in a way that fits the format of the 'formula' argument.
+
+```{r, var names function}
+vars <- names(train[,2:14])
+
+# concatenating strings
+func <- paste(vars, collapse=' + ')
+func <- paste('target ~',func)
+
+# converting to formula
+func <- as.formula(func)
+
+func
+```
+
+This was the point where I actually listened to my Discover Weekly playlist and made a note of which songs I liked and which songs I didn't. Because the data is in the same order as the songs in the playlist, I can create a string from my ratings, split the string, convert those values into a 1x30 data frame, and set my target variable to the recorded values.
+
+```{r, ratings}
+#creating ratings for discover weekly
+ratings <- "010010101101000000001011000011"
+ratings = strsplit(as.character(ratings), "")
+ratings <- as.data.frame(ratings)
+colnames(ratings) <- "target"
+test$target <- ratings$target
+```
+
+```{r, running neural net}
+#running neural net
+set.seed(123)
+nn1 = neuralnet(func,train,hidden=10,linear.output=FALSE, stepmax = 1e+08, threshold = 0.001)
+
+predicted.values = neuralnet::compute(nn1,test[,2:14])
+predicted.values$net.result =sapply(
+    predicted.values$net.result,round,digits=0)
+
+plot(nn1, rep="best")
+```
+
+I am using a 'hidden' value of 10, which I decided on by calculating the error rate of values 1:20 and using the value corresponding to the minimum error:
+
+```{r}
+#used to find optimal 'hidden' value
+for(i in 1:20){
+set.seed(123)
+nn1 = neuralnet(func,train,hidden=i,linear.output=FALSE, stepmax = 1e+08, threshold = 0.001)
+
+predicted.values = neuralnet::compute(nn1,test[,2:14])
+predicted.values$net.result =sapply(
+    predicted.values$net.result,round,digits=0)
+
+print(c(c(paste0("hidden = ",substr(i,1,2))), c(paste0("error rate = ",substr(1 - mean(predicted.values$net.result==test$target), 1, 4)))))
+}
+```
+
+```{r, results}
+confusionMatrix(as.factor(predicted.values$net.result), as.factor(test$target), positive = NULL, dnn = c("Prediction", "Reference"))
+```
+
+Unfortunately, the R console and R Markdown use separate seeds, so *the model reflected in this markdown provides different results than the console*. The markdown file shows an accuracy of about 47%, when in reality, it has an accuracy of about 67%.
+
+Looking at the results of the neural network, the model created (in console) is able to predict with ~67% accuracy whether or not I will like a given song based on its audio features. This is not a great accuracy, at least, not to the level that I would like it to be. While working on this project, my Discover Weekly playlist updated and gave me 30 new suggestions. I took this opportunity to repeat the process and see how the model performs against a new testing set.
+
+```{r, warning=FALSE, message=FALSE}
+tracks1 <- spotifyr::get_playlist_tracks("4ISw66mIYAdbeZb9qcrrSP") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+
+tracks2 <- spotifyr::get_playlist_tracks("01rfBVllJPvMN2F9og8OJ2") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+#random sample so like/dislike ratio is even 1:1
+set.seed(123)
+tracks2_list <- sample(c(1:100), 63, replace=FALSE)
+tracks2 <- tracks2[tracks2_list,]
+
+tracks3.2 <- spotifyr::get_playlist_tracks("0bi8cmea41pTokApA0huIO") %>%
+  dplyr::select(track.id, track.artists, track.duration_ms, track.explicit, track.name, track.album.id)
+
+tracks2 <- rbind(tracks1, tracks2, tracks3.2)
+```
+
+```{r, eval=FALSE}
+get_features2 <- function(tracks2) {
+    get_track_audio_features(tracks2$track.id)
+}
+tracks_features2 <- tracks2 %>%
+  group_split(track.id) %>%
+  map_dfr(get_features2) %>%
+  write_rds("tracks_features2.rds")
+```
+
+```{r, echo=FALSE}
+#getting audio features and cleaning data
+tracks_features2 <- read_rds('tracks_features2.rds')
+tracks_features2 <- dplyr::rename(tracks_features2, track_id = id)
+tracks_features2 <- tracks_features2[,c(1:11, 13)]
+
+tracks2 <- tracks2 %>%
+  unnest()
+tracks2 <- tracks2[!duplicated(tracks2$track.id),]
+
+tracks2 <- tracks2[,c(1, 3, 4, 8, 9, 10, 11)]
+tracks2 <- dplyr::rename(tracks2, artist_id = id, track_id = track.id, artist_name = name, duration_ms = track.duration_ms, explicit = track.explicit, track_name = track.name, album_id = track.album.id)
+
+tracks2 <- tracks2 %>%
+  left_join(tracks_features2, by="track_id")
+
+tracks2 <- tracks2[,c(1, 6, 2, 3, 4, 5, 8:18, 7)]
+
+#target variable + dummy explicit
+target2 <- c(rep(0, 63), rep(1, 63), rep(NA, 30))
+tracks2 <- cbind(tracks2, target2)
+
+tracks2$explicit <- ifelse(tracks2$explicit==TRUE, 1, 0)
+
+#scaling data
+maxs=apply(tracks2[,5:17], 2, max)
+mins=apply(tracks2[,5:17], 2, min)
+tracks.sd2 <- as.data.frame(scale(tracks2[,5:17],center = mins, scale = maxs - mins))
+tracks.sd2 = cbind(tracks2$target,tracks.sd2)
+tracks.sd2 <- dplyr::rename(tracks.sd2, target = "tracks2$target")
+
+test2 <- tracks.sd2[127:156,]
+train2 <- tracks.sd2[1:126,]
+
+#target for 2nd playlist
+ratings2 <- "110110100000011101001100101001"
+ratings2 = strsplit(as.character(ratings2), "")
+ratings2 <- as.data.frame(ratings2)
+colnames(ratings2) <- "target"
+test2$target <- ratings2$target
+```
+
+```{r}
+for(i in 1:20){
+set.seed(123)
+nn2 = neuralnet(func,train2,hidden=i,linear.output=FALSE, stepmax = 1e+08, threshold = 0.001)
+
+predicted.values2 = neuralnet::compute(nn2,test2[,2:14])
+predicted.values2$net.result =sapply(
+    predicted.values2$net.result,round,digits=0)
+
+print(c(c(paste0("hidden = ",substr(i,1,2))), c(paste0("error rate = ",substr(1 - mean(predicted.values2$net.result==test2$target), 1, 4)))))
+}
+```
+
+
+```{r}
+set.seed(123)
+nn2 = neuralnet(func,train2,hidden=5,linear.output=FALSE, stepmax = 1e+08, threshold = 0.001)
+
+predicted.values2 = neuralnet::compute(nn2,test2[,2:14])
+predicted.values2$net.result =sapply(
+    predicted.values2$net.result,round,digits=0)
+
+plot(nn2, rep="best")
+
+confusionMatrix(as.factor(predicted.values2$net.result), as.factor(test2$target), positive = NULL, dnn = c("Prediction", "Reference"))
+```
+
+Unfortunately, using the second test set yielded worse results, with a model accuracy of only 60%. Both of these models are only marginally better at predicting whether I will like a song than flipping a coin would be, which is certainly not ideal in application.
+
+# Conclusion
+
+In conclusion, this was a very fun project to work on. Being able to analyze my own personal Spotify data was a very different experience in that I had a personal connection to the data. Every insight was particularly interesting to me, as I hope it was to you. I highly recommend any music junkies like me investigate their own Spotify libraries and see what they find. Having my own ideas about my listening habits and then seeing those ideas backed up by data is a pretty cool experience. Moving forward, I would love to learn more about how Spotify generates their Discover Weekly playlists and what other factors contribute to those 30 songs (my initial hypotheses include recent listening history, what your friends are listening to/what's popular right now, or even injecting some randomness to keep things different and fresh).
