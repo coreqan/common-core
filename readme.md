@@ -1,5 +1,9 @@
 This repository contains various data analysis projects conducted in R. 
 
+[Analysis of My Spotify Library](https://rpubs.com/coreqan/spotify)
+
+* Performing EDA, PCA, and neural network analysis on my personal Spotify library. Investigating accuracy of Discover Weekly playlist (May 2021).
+
 [Statistical Analysis of Common Core Data](https://rpubs.com/coreqan/common-core)
 
 * Using basic statistical analysis methods to investigate relationship between demographic makeup of students to the amount of funding a school will receive.
